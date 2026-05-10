@@ -1,6 +1,14 @@
 # PLC-MQTT Communication Gateway using USR-W610
 
-This project demonstrates a robust communication link between a PLC and a local monitoring station. By utilizing the USR-W610 in a local WiFi environment, data is retrieved from PLC registers via Modbus RTU and served locally via Modbus TCP. This setup is designed for high-security industrial environments where external internet access is not there
+This project demonstrates a robust communication link between a PLC and a local monitoring station. By utilizing the USR-W610 in a local WiFi environment, data is retrieved from PLC registers via Modbus RTU and served locally via Modbus TCP. This setup is designed for high-security industrial environments where external internet access is restricted.
+
+This project can be configured to be used through a wifi with no internet access in which case only devices connected to the same wifi as the USR-W610 can access the data.
+
+Or the data can be accessed through A Mqtt Broker through the Internet .
+
+The python code for a dashboard for the no internet wifi case is attached,and for the mqtt case a html file is attached.
+
+Read the Sop-Usr for further clarifications.
 
 Key Features:
 
