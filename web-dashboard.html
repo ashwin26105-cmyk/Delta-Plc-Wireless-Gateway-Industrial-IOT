@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PLC Modbus Dashboard</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        :root {
+            --bg: #121212; --panel: #1e1e1e; --text: #e0e0e0;
+            --dim: #757575; --red: #ff5252; --white: #ffffff;
+            --yellow: #ffd600; --orange: #ff9800; --green: #69f0ae;
+            --border: #333;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg); color: var(--text);
+            margin: 0; padding: 20px;
+        }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+        .controls { background: var(--panel); padding: 15px; border-radius: 6px; margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap; border: 1px solid var(--border); }
+        .controls input { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 8px; border-radius: 4px; }
+        .controls button { background: #1976d2; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .controls button:disabled { background: var(--dim); cursor: not-allowed; }
+        #btn-dis { background: var(--red); display: none; }
+        
+        .led { width: 12px; height: 12px; border-radius: 50%; display: inline-block; background: var(--dim); margin-right: 8px; }
+        .led.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+        .led.blink { background: var(--yellow); animation: blink 1s infinite; }
+        .led.err { background: var(--red); box-shadow: 0 0 8px var(--red); }
+        @keyframes blink { 50% { opacity: 0.3; } }
+
+        .stats { display: flex; gap: 20px; background: var(--panel); padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; font-size: 0.9em; border: 1px solid var(--border); }
+        .stats span { color: var(--green); font-weight: bold; }
+
+        .notice { background: #2c2c2c; padding: 10px; border-left: 4px solid var(--yellow); margin-bottom: 20px; font-size: 0.9em; }
+        .notice.green { border-left-color: var(--green); }
+
+        .raw-box { background: #000; padding: 10px; font-family: monospace; border-radius: 4px; margin-bottom: 20px; color: var(--green); word-break: break-all; }
+        .raw-box div:first-child { color: var(--dim); margin-bottom: 5px; }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .rc { background: var(--panel); border: 1px solid var(--border); padding: 15px; border-radius: 6px; text-align: center; position: relative; transition: background 0.3s; }
+        .rc.flash { background: #2a3b2c; }
+        .rc-tag { font-size: 0.7em; color: var(--dim); position: absolute; top: 10px; left: 10px; }
+        .rc-name { font-size: 1.2em; font-weight: bold; margin: 15px 0 10px 0; color: var(--yellow); }
+        .rc-val { font-size: 2.5em; font-weight: bold; }
+        .rc-val.stale { opacity: 0.3; }
+        .rc-foot { display: flex; justify-content: space-between; font-size: 0.7em; color: var(--dim); margin-top: 10px; }
+
+        .log-box { background: #000; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 0.85em; border-radius: 4px; }
+        .lt { color: var(--dim); margin-right: 10px; }
+        .lok { color: var(--green); }
+        .lerr { color: var(--red); }
+        .linf { color: var(--text); }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>PLC Modbus Dashboard</h2>
+        <div><span id="led" class="led"></span><span id="ctext">DISCONNECTED</span></div>
+    </div>
+
+    <div class="controls">
+        <input type="text" id="host" placeholder="Broker URL" value="broker.hivemq.com">
+        <input type="number" id="port" placeholder="Port" value="8000">
+        <input type="text" id="user" placeholder="Username (opt)">
+        <input type="password" id="pass" placeholder="Password (opt)">
+        <input type="text" id="topic" placeholder="MQTT Topic" value="titan/test/plc/123">
+        <button id="btn-con" onclick="doConnect()">CONNECT</button>
+        <button id="btn-dis" onclick="doDisconnect()">DISCONNECT</button>
+    </div>
+
+    <div id="notice" class="notice">
+        ⚠ <strong>RAW BYTE MODE:</strong> Expecting raw Modbus RTU bytes from USR-W610. Format: <strong>01 03 04 [D100_hi D100_lo]...</strong> &nbsp;
+        <label style="cursor:pointer;color:var(--yellow)">
+            <input type="checkbox" id="jmode" onchange="switchMode()"> JSON mode
+        </label>
+    </div>
+
+    <div class="stats">
+        <div>Broker: <span id="st-b">—</span></div>
+        <div>Topic: <span id="st-t">—</span></div>
+        <div>Messages: <span id="st-m">0</span></div>
+        <div>Interval: <span id="st-r">0ms</span></div>
+        <div>Last Rx: <span id="st-l">—</span></div>
+    </div>
+
+    <div class="raw-box">
+        <div id="rt">▶ Waiting for data...</div>
+        <div id="raw-hex">...</div>
+    </div>
+
+    <div class="grid" id="grid"></div>
+
+    <div class="log-box" id="log"></div>
+
+    <script>
+        // Based on Heartbeat: 01 03 00 64 00 02 (Reads 2 registers starting at D100)
+        const TARGET_REGS = [100, 101]; 
+        
+        let mqttClient = null;
+        let msgCount = 0;
+        let lastRx = null;
+        let intervals = [];
+        let jsonMode = false;
+
+        function buildCards() {
+            const grid = document.getElementById('grid');
+            grid.innerHTML = '';
+            TARGET_REGS.forEach(reg => {
+                const addr = (0x1000 + reg).toString(16).toUpperCase(); // Optional offset depending on your PLC
+                grid.innerHTML += `
+                    <div class="rc" id="rc${reg}">
+                        <div class="rc-tag">REG ${String(reg).padStart(3,'0')}</div>
+                        <div class="rc-name">D${reg}</div>
+                        <div class="rc-val stale" id="rv${reg}">—</div>
+                        <div class="rc-foot">
+                            <span class="rc-addr">Addr: ${reg}</span>
+                            <span class="rc-unit">INT16</span>
+                        </div>
+                    </div>`;
+            });
+        }
+        buildCards();
+
+        function log(msg, type='inf') {
+            const el = document.getElementById('log');
+            const t = new Date().toLocaleTimeString('en-GB');
+            const d = document.createElement('div');
+            d.innerHTML = `<span class="lt">${t}</span><span class="l${type}">${msg}</span>`;
+            el.insertBefore(d, el.firstChild);
+            if (el.children.length > 60) el.removeChild(el.lastChild);
+        }
+
+        function setLed(cls, txt) {
+            document.getElementById('led').className = 'led ' + cls;
+            document.getElementById('ctext').textContent = txt;
+        }
+
+        // ── CONNECT ────────────────────────────────────────────────────
+        function doConnect() {
+            const host = document.getElementById('host').value.trim();
+            const port = parseInt(document.getElementById('port').value) || 8000;
+            const user = document.getElementById('user').value.trim();
+            const pass = document.getElementById('pass').value;
+            const topic = document.getElementById('topic').value.trim();
+
+            if (!host || !topic) {
+                log('Please fill Broker URL and Topic.', 'err');
+                return;
+            }
+
+            buildCards();
+            setLed('blink', 'CONNECTING...');
+            
+            const scheme = port === 8000 || port === 1883 ? 'ws' : 'wss';
+            // Note: browser MQTT uses websockets, so connecting to port 1883 usually fails unless the broker maps WS to it. HiveMQ uses 8000 for WS.
+            const url = `${scheme}://${host}:${port}/mqtt`;
+            log(`Connecting → ${url}`, 'inf');
+
+            const options = {
+                username: user || undefined,
+                password: pass || undefined,
+                clientId: 'plcdash-' + Math.random().toString(16).slice(2, 8),
+                clean: true
+            };
+
+            try {
+                mqttClient = mqtt.connect(url, options);
+            } catch(e) {
+                log('Connect script error: ' + e.message, 'err');
+                return;
+            }
+
+            mqttClient.on('connect', () => {
+                setLed('on', 'CONNECTED');
+                log('Connected to Broker ✓', 'ok');
+                
+                mqttClient.subscribe(topic, { qos: 0 }, (err) => {
+                    if (err) log('Subscribe failed: ' + err.message, 'err');
+                    else log('Subscribed to "' + topic + '" ✓', 'ok');
+                });
+                
+                document.getElementById('st-b').textContent = host.slice(0, 15) + '...';
+                document.getElementById('st-t').textContent = topic;
+                document.getElementById('btn-con').disabled = true;
+                document.getElementById('btn-dis').style.display = 'inline-block';
+            });
+
+            mqttClient.on('message', (t, payload) => onMsg(t, payload));
+
+            mqttClient.on('error', (e) => {
+                setLed('err', 'ERROR');
+                log('MQTT error: ' + (e.message || 'Connection failed.'), 'err');
+            });
+
+            mqttClient.on('close', () => {
+                setLed('err', 'CLOSED');
+                log('Connection closed.', 'err');
+                document.getElementById('btn-con').disabled = false;
+                document.getElementById('btn-dis').style.display = 'none';
+            });
+        }
+
+        // ── DISCONNECT ─────────────────────────────────────────────────
+        function doDisconnect() {
+            if (mqttClient) {
+                mqttClient.end(true);
+                mqttClient = null;
+            }
+            setLed('', 'DISCONNECTED');
+            document.getElementById('btn-con').disabled = false;
+            document.getElementById('btn-dis').style.display = 'none';
+            log('Disconnected manually.', 'inf');
+        }
+
+        // ── MODE TOGGLE ────────────────────────────────────────────────
+        function switchMode() {
+            jsonMode = document.getElementById('jmode').checked;
+            const n = document.getElementById('notice');
+            if (jsonMode) {
+                n.className = 'notice green';
+                n.innerHTML = '✅ <strong>JSON MODE:</strong> Expecting <strong>{"D100":1234,"D101":5678,...}</strong>. &nbsp;<label style="cursor:pointer;color:var(--yellow)"><input type="checkbox" id="jmode" onchange="switchMode()" checked> JSON mode</label>';
+            } else {
+                n.className = 'notice';
+                n.innerHTML = '⚠ <strong>RAW BYTE MODE:</strong> Expecting raw Modbus RTU bytes from USR-W610. Format: <strong>01 03 04 [D100_hi D100_lo]...</strong> &nbsp;<label style="cursor:pointer;color:var(--yellow)"><input type="checkbox" id="jmode" onchange="switchMode()"> JSON mode</label>';
+            }
+            log('Payload mode switched to: ' + (jsonMode ? 'JSON' : 'RAW BYTES'), 'inf');
+        }
+
+        // ── UPDATE CARD ────────────────────────────────────────────────
+        function setCard(reg, val) {
+            const ve = document.getElementById('rv' + reg);
+            const ce = document.getElementById('rc' + reg);
+            if (!ve || !ce) return;
+            
+            ve.textContent = val;
+            ve.classList.remove('stale');
+            ve.style.color = val === 0 ? 'var(--dim)' : val < 0 ? 'var(--red)' : val > 32000 ? 'var(--orange)' : 'var(--white)';
+            
+            ce.classList.remove('flash');
+            void ce.offsetWidth; 
+            ce.classList.add('flash');
+        }
+
+        // ── HANDLE MESSAGE (INTEGRATED ROBUST PARSER) ──────────────────
+        function onMsg(topic, payload) {
+            msgCount++;
+            const now = Date.now();
+            if (lastRx) {
+                intervals.push(now - lastRx);
+                if (intervals.length > 5) intervals.shift(); // Keep last 5 samples for fast average
+                document.getElementById('st-r').textContent = Math.round(intervals.reduce((a, b) => a + b, 0) / intervals.length) + 'ms';
+            }
+            lastRx = now;
+            document.getElementById('st-m').textContent = msgCount;
+            document.getElementById('st-l').textContent = new Date().toLocaleTimeString('en-GB');
+            
+            const bytes = Array.from(payload);
+            const hexStr = bytes.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+            
+            document.getElementById('rt').textContent = '▶ topic: ' + topic;
+            document.getElementById('raw-hex').textContent = hexStr;
+            
+            if (jsonMode) {
+                // --- JSON PARSING LOGIC ---
+                try {
+                    const data = JSON.parse(new TextDecoder().decode(payload));
+                    TARGET_REGS.forEach(reg => {
+                        if (data['D' + reg] !== undefined) setCard(reg, data['D' + reg]);
+                    });
+                    log('JSON rx: Decoded successfully', 'lok');
+                } catch(e) {
+                    log('JSON parse error: ' + e.message, 'lerr');
+                }
+            } else {
+                // --- ROBUST BUFFER PARSER FOR RAW MODBUS RTU ---
+                let i = 0;
+                let successCount = 0;
+                let decodedLog = [];
+                
+                while (i < bytes.length) {
+                    if (bytes.length - i < 5) break; // Not enough bytes left for a full frame
+                    
+                    const slave = bytes[i];
+                    const fc = bytes[i+1];
+                    
+                    if (fc === 0x03) {
+                        const byteCount = bytes[i+2];
+                        if (bytes.length - i < 3 + byteCount + 2) break; // Wait for rest of payload
+                        
+                        const numRegs = Math.floor(byteCount / 2);
+                        for (let r = 0; r < numRegs && r < TARGET_REGS.length; r++) {
+                            let v = (bytes[i + 3 + r * 2] << 8) | bytes[i + 4 + r * 2];
+                            if (v > 32767) v -= 65536; // Handle signed 16-bit
+                            
+                            setCard(TARGET_REGS[r], v);
+                            decodedLog.push(`D${TARGET_REGS[r]}=${v}`);
+                        }
+                        successCount++;
+                        i += (3 + byteCount + 2); // Jump forward to the next frame
+                    } 
+                    else if (fc === 0x83) {
+                        log('PLC rejected corrupted request (Noise/Parity Issue)', 'lerr');
+                        i += 5; // Error frames are exactly 5 bytes
+                    } 
+                    else {
+                        i++; // Unknown garbage byte, step forward by 1 to re-sync
+                    }
+                }
+                
+                if (successCount > 0) log('Decoded: ' + decodedLog.join(', '), 'lok');
+            }
+        }
+
+        log('Dashboard ready. Setup for D100 and D101.', 'linf');
+    </script>
+</body>
+</html>
